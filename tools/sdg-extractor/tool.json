@@ -5,29 +5,43 @@
   "config": {
     "fields": {
       "build-dir-key": {
-        "aliases": ["build-dir-key", "buildDirKey"]
+        "aliases": [
+          "build-dir-key",
+          "buildDirKey"
+        ]
       },
       "output": {
-        "aliases": ["output"],
+        "aliases": [
+          "output"
+        ],
         "path": true
       },
       "target": {
-        "aliases": ["target"],
+        "aliases": [
+          "target"
+        ],
         "path": true
       },
       "bitcode-list": {
-        "aliases": ["bitcode-list", "bitcodeList"],
+        "aliases": [
+          "bitcode-list",
+          "bitcodeList"
+        ],
         "path": true
       },
       "artifacts": {
-        "aliases": ["artifacts"],
+        "aliases": [
+          "artifacts"
+        ],
         "repeatable": true
       }
     }
   },
   "managed": {
     "schemaVersion": 1,
-    "modes": ["local"],
+    "modes": [
+      "local"
+    ],
     "local": {
       "sourceTemplate": "tools/sdg-extractor/queries",
       "buildDirTemplate": "tools/sdg-extractor/builds/{buildDirKey}/build",
@@ -61,7 +75,9 @@
       "commands": {
         "build": {
           "requiredFlags": [],
-          "scalarFlags": ["build-dir"],
+          "scalarFlags": [
+            "build-dir"
+          ],
           "repeatableFlags": [],
           "pathFlags": {
             "build-dir": "tools/sdg-extractor/builds/{buildDirKey}/build"
@@ -71,7 +87,7 @@
             "shell": "bash"
           },
           "result": {
-            "successSummary": "built sdg-extractor LLVM pass",
+            "successSummary": "built unified SDG CodeQL queries",
             "errorSummary": "sdg-extractor build failed",
             "manifestTemplate": "{build-dir}/manifest.json",
             "artifact": {
@@ -81,11 +97,15 @@
           }
         },
         "exec": {
-          "requiredFlags": ["output"],
+          "requiredFlags": [
+            "output"
+          ],
           "scalarFlags": [
             "output",
             "build-dir",
-            "bitcode-list"
+            "bitcode-list",
+            "source-dir",
+            "kbuild-dir"
           ],
           "repeatableFlags": [],
           "pathFlags": {
@@ -97,12 +117,12 @@
             "shell": "bash"
           },
           "result": {
-            "successSummary": "extracted SDG rules from bitcode",
+            "successSummary": "extracted SDG facts from unified kernel database",
             "errorSummary": "sdg-extractor rule extraction failed",
             "manifestTemplate": "{output}/manifest.json",
             "artifact": {
               "path": "manifest",
-              "locationTemplate": "{output}/sdg-extractor-manifest.json"
+              "locationTemplate": "{output}/manifest.json"
             },
             "details": {
               "output": "{output}"
@@ -110,8 +130,12 @@
           }
         },
         "inspect": {
-          "requiredFlags": ["target"],
-          "scalarFlags": ["target"],
+          "requiredFlags": [
+            "target"
+          ],
+          "scalarFlags": [
+            "target"
+          ],
           "repeatableFlags": [],
           "script": {
             "path": "scripts/inspect.sh",
@@ -122,8 +146,12 @@
           }
         },
         "logs": {
-          "requiredFlags": ["target"],
-          "scalarFlags": ["target"],
+          "requiredFlags": [
+            "target"
+          ],
+          "scalarFlags": [
+            "target"
+          ],
           "repeatableFlags": [],
           "script": {
             "path": "scripts/logs.sh",
