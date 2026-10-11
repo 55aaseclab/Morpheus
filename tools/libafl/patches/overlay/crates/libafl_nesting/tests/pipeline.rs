@@ -29,33 +29,49 @@ fn converter_path() -> std::path::PathBuf {
 }
 
 /// A synthetic but valid extractor rule: the docs' feature-guard pattern
-/// with a feature-word read, a config-byte read, a BitSet precondition, a
-/// Gt target state, and a SetBoundary hint.
-const RULES_JSON: &str = r#"{"rules": [{
+/// with a feature-word read, a config-byte read, a BitSet-style evaluable
+/// precondition, a Gt target state, and a SetBoundary hint.
+const RULES_JSON: &str = r#"{"version": "1.2", "rules": [{
   "id": "rule:probe|target:mmio:273:1:rss_max_key_size|predicate:gt:unsigned:40",
   "function": "probe",
-  "vars": [
-    {"id": "mmio:16:4:features",
-     "source": {"class": "Mmio", "access_kind": "config", "offset": 16,
-                "size_bytes": 4, "field": "features"}},
-    {"id": "mmio:273:1:rss_max_key_size",
-     "source": {"class": "Mmio", "access_kind": "config", "offset": 273,
-                "size_bytes": 1, "field": "rss_max_key_size"}}
-  ],
-  "preconditions": [
-    {"src": "mmio:16:4:features", "dst": "mmio:273:1:rss_max_key_size",
-     "head": "head_guard",
-     "predicate": {"kind": "BitSet", "bit": 25}}
-  ],
+  "status": "conditional",
+  "vars": ["mmio:16:4:features", "mmio:273:1:rss_max_key_size"],
+  "path": {"source": "mmio:16:4:features", "sink": "mmio:273:1:rss_max_key_size",
+           "edges": ["edge:probe:guard"]},
+  "preconditions": {"kind": "And", "operands": [
+    {"kind": "&", "left": {"node": "mmio:16:4:features"},
+     "right": {"kind": "Const", "value": 33554432}}
+  ]},
   "target_state": {
     "src": "mmio:273:1:rss_max_key_size",
     "dst": "mmio:273:1:rss_max_key_size",
     "head": "head_bound",
-    "predicate": {"kind": "Gt", "value": 40, "signedness": "Unsigned"}
+    "predicate": {"kind": "Gt", "left": {"node": "mmio:273:1:rss_max_key_size"},
+                  "right": {"kind": "Const", "value": 40}}
   },
-  "mutation": {"operator": "SetBoundary", "side": "Above",
-               "var": "mmio:273:1:rss_max_key_size"}
+  "mutation_hint": [{"operator": "SampleRange", "var": "mmio:16:4:features",
+                     "min": 33554432, "max": 4294967295}],
+  "validation": {"method": "typed bit-vector constraints", "result": "sat",
+                 "source_assignments": {"mmio:16:4:features": 33554432}},
+  "assumptions": [{"kind": "kernel_path_condition", "status": "assumed"}]
 }]}"#;
+
+const NODES_JSON: &str = r#"{"version": "1.2", "nodes": [
+  {"id": "mmio:16:4:features", "kind": "source",
+   "source": {"kind": "MmioRead", "offset": 16, "size_bytes": 4,
+              "byte_order": "Little", "access": "config", "access_context": []},
+   "type": {"width": 32, "signedness": "Unsigned"}},
+  {"id": "mmio:273:1:rss_max_key_size", "kind": "sink",
+   "source": {"kind": "MmioRead", "offset": 273, "size_bytes": 1,
+              "byte_order": "Little", "access": "config", "access_context": []},
+   "type": {"width": 8, "signedness": "Unsigned"}}
+]}"#;
+
+const EDGES_JSON: &str = r#"{"version": "1.2", "self_edges": [], "cross_edges": [
+  {"id": "edge:probe:guard", "src": "mmio:16:4:features",
+   "dst": "mmio:273:1:rss_max_key_size", "head": "head_guard",
+   "predicate": {"kind": "BitSet", "bit": 25}}
+]}"#;
 
 /// Serialize the env-var manipulation behind one lock, like the unit tests.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -103,6 +119,10 @@ fn end_to_end_json_to_runtime_pipeline() {
     std::fs::create_dir_all(&dir).expect("temp dir should be created");
     let rules_file = dir.join("sdg-rules.json");
     std::fs::write(&rules_file, RULES_JSON).expect("rules json should be written");
+    std::fs::write(dir.join("sdg-nodes.json"), NODES_JSON)
+        .expect("nodes json should be written");
+    std::fs::write(dir.join("sdg-edges.json"), EDGES_JSON)
+        .expect("edges json should be written");
     let out_dir = dir.join("sdg");
 
     let status = std::process::Command::new("python3")
@@ -126,7 +146,12 @@ fn end_to_end_json_to_runtime_pipeline() {
         rule.name,
         "rule:probe|target:mmio:273:1:rss_max_key_size|predicate:gt:unsigned:40"
     );
-    assert_eq!(rule.preconditions.len(), 1);
+    // Semantic rules carry the evaluable precondition in the private
+    // semantic record; the public contract is the status and the resolved
+    // runtime bindings.
+    let semantic = rule.semantic.as_ref().expect("the rule is semantic");
+    assert_eq!(semantic.status, "conditional");
+    assert!(semantic.blockers.is_empty(), "the rule's sources are bound: {:?}", semantic.blockers);
 
     // Semantic generation: the actual Generator registers the semantic
     // scenario and its exact placements for the encoded bytes.
@@ -146,25 +171,21 @@ fn end_to_end_json_to_runtime_pipeline() {
         .as_u64()
         .unwrap();
     assert!(features & (1 << 25) != 0, "the BitSet precondition holds");
-    let key_size = scenario
-        .value("mmio:273:1:rss_max_key_size")
-        .expect("the target variable is present")
-        .as_u64()
-        .unwrap();
-    assert!(key_size > 40, "the target state holds: {key_size}");
-    // Placements are recorded for every semantic variable.
+    // Runtime scenarios encode the source observations; the sink stays in
+    // the document for traceability.
+    assert!(
+        scenario.value("mmio:273:1:rss_max_key_size").is_none(),
+        "the sink is not part of the runtime scenario"
+    );
+    // Placements are recorded for every source observation.
     assert!(scenario.placements.contains_key("mmio:16:4:features"));
-    assert!(scenario.placements.contains_key("mmio:273:1:rss_max_key_size"));
+    assert!(!scenario.placements.contains_key("mmio:273:1:rss_max_key_size"));
 
     // Lowering produces the wire format with aligned word models; the
     // scenario reads back from the wire through its exact placements.
     assert!(
         input.mmio.word_models.iter().any(|m| m.offset == 0x10),
         "the feature word is modelled"
-    );
-    assert!(
-        input.mmio.word_models.iter().any(|m| m.offset == 0x110),
-        "the config byte is mask-merged into the aligned word"
     );
     let lifted = libafl_nesting::lift_with(&input, rule, &scenario.placements)
         .expect("the scenario lifts back through its exact placements");
@@ -175,11 +196,11 @@ fn end_to_end_json_to_runtime_pipeline() {
     let mut mutator = ScenarioMutator::new(generator.clone());
     let parent_placement = scenario
         .placements
-        .get("mmio:273:1:rss_max_key_size")
+        .get("mmio:16:4:features")
         .copied()
-        .expect("the target placement is recorded");
+        .expect("the source placement is recorded");
     let mut validated_child = None;
-    for seed in 0..64u64 {
+    for seed in 0..128u64 {
         let mut candidate = input.clone();
         let mut rng = TestState { rand: StdRand::with_seed(seed) };
         if !mutator
@@ -192,27 +213,34 @@ fn end_to_end_json_to_runtime_pipeline() {
             .metadata()
             .lookup(&candidate)
             .expect("the mutator registers metadata for the child bytes");
-        // Exact placement validation: the child keeps the target's stored
-        // region and visit, and the full placement map is preserved.
+        // The rule-aware branch mutates the exact stored scenario, so the
+        // full placement map is preserved. A switched result carries fresh
+        // random placements and is not this test's subject.
+        if child.placements != scenario.placements {
+            continue;
+        }
+        // Exact placement validation: the child keeps the source's stored
+        // region and visit.
         assert_eq!(
-            child.placements.get("mmio:273:1:rss_max_key_size").copied(),
+            child.placements.get("mmio:16:4:features").copied(),
             Some(parent_placement),
-            "only the stored target region and visit may be used"
+            "only the stored source region and visit may be used"
         );
-        assert_eq!(child.placements, scenario.placements);
-        // Exact target and precondition validation.
-        let child_key = child
-            .value("mmio:273:1:rss_max_key_size")
-            .expect("the target variable survives")
-            .as_u64()
-            .unwrap();
-        assert!(child_key > 40, "the target state holds after mutation: {child_key}");
+        // Exact target and precondition validation. A switched result can
+        // coincide with the parent here (same single rule, same initial
+        // value); the value change identifies a rule-aware mutation.
         let child_features = child
             .value("mmio:16:4:features")
-            .expect("the precondition variable survives")
+            .expect("the source variable survives")
             .as_u64()
             .unwrap();
-        assert!(child_features & (1 << 25) != 0, "the precondition is preserved");
+        if child_features == features {
+            continue;
+        }
+        assert!(
+            child_features & (1 << 25) != 0,
+            "the precondition is preserved: {child_features}"
+        );
         // The child scenario lifts back from the child bytes.
         let child_lifted =
             libafl_nesting::lift_with(&candidate, rule, &child.placements)

@@ -53,6 +53,16 @@ fn sdg_metadata_dir(corpus_dir: &Path) -> PathBuf {
         .unwrap_or_else(|_| ScenarioMetadataStore::sidecar_dir_for_corpus(corpus_dir))
 }
 
+/// The number of generated semantic seeds: an explicit
+/// `MORPHEUS_LIBAFL_INITIAL_GENERATED_SEEDS` override, or the default of
+/// eight rule families.
+fn initial_generated_seeds() -> usize {
+    std::env::var("MORPHEUS_LIBAFL_INITIAL_GENERATED_SEEDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8)
+}
+
 /// Build the scenario generator from the environment and point its shared
 /// metadata store at the persistent sidecar. Generator and mutator clones
 /// share the store; records are written atomically and lazy-loaded, so
@@ -340,7 +350,7 @@ pub fn fuzz() {
                             panic!("no valid initial fuzz inputs loaded");
                         }
                     } else {
-                        for _ in 0..4 {
+                        for _ in 0..initial_generated_seeds() {
                             let input = initial_scenario_generator.generate(&mut state).unwrap();
                             state.corpus_mut().add(input.into()).unwrap();
                         }
@@ -349,11 +359,14 @@ pub fn fuzz() {
                     // seeds so grammar mutation has exact source placements.
                     if replay_inputs.is_none() && initial_inputs.is_some()
                         && initial_scenario_generator.rule_counts().1 > 0 {
-                        for _ in 0..4 {
+                        let count = initial_generated_seeds();
+                        for _ in 0..count {
                             let input = initial_scenario_generator.generate(&mut state).unwrap();
                             state.corpus_mut().add(input.into()).unwrap();
                         }
-                        eprintln!("[libafl/qemu_nesting] added 4 SDG seeds with semantic metadata");
+                        eprintln!(
+                            "[libafl/qemu_nesting] added {count} SDG seeds with semantic metadata"
+                        );
                     }
                     eprintln!(
                         "[libafl/qemu_nesting] initial corpus entries={}",

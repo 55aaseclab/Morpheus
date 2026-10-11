@@ -77,8 +77,18 @@ ignored. Empty or wholly blocked rule sets select random fallback unless the
 harness is configured with `MORPHEUS_LIBAFL_REQUIRE_SDG=true`.
 
 The harness logs loaded/executable rule counts. When initial seed files are
-provided in grammar mode, it also adds four generated semantic seeds so
+provided in grammar mode, it also adds eight generated semantic seeds so
 rule-aware mutation has metadata for corpus entries.
+
+## Rule switching
+
+Rule selection happens once per generated scenario, so a corpus that
+descends from a few seeds would stay on those rule families forever. A
+deterministic probability (`RULE_SWITCH_PROBABILITY`, 1/4) replaces the
+input with a fresh scenario for a random executable rule; the generator
+registers the fresh scenario's metadata for the new bytes, so switched
+inputs stay rule-aware. Wire-only seeds without metadata take this path
+too, entering the rule space instead of ending as dead-end wire mutants.
 
 ## Semantic metadata sidecar
 

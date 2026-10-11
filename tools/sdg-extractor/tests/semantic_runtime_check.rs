@@ -80,6 +80,7 @@ fn main() {
     }
     let mut integration_generated = 0;
     let mut integration_mutated = 0;
+    let mut integration_switched = 0;
     let mut mutator = mutator::ScenarioMutator::new(generator.clone());
     for seed in 0..32 {
         let mut state = State { random: StdRand::with_seed(seed) };
@@ -92,9 +93,21 @@ fn main() {
             if mutator.mutate(&mut state, &mut input).unwrap() == MutationResult::Mutated {
                 check_wire(&input);
                 if let Some(child) = generator.metadata().lookup(&input) {
-                    assert_eq!(child.placements, parent.placements);
-                    assert_eq!(lift_with(&input, rule, &child.placements).unwrap().values, child.values);
-                    integration_mutated += 1;
+                    if child.target_rule == parent.target_rule {
+                        // Rule-aware mutation of the exact stored scenario:
+                        // the parent's placements are preserved.
+                        assert_eq!(child.placements, parent.placements);
+                        assert_eq!(lift_with(&input, rule, &child.placements).unwrap().values, child.values);
+                        integration_mutated += 1;
+                    } else {
+                        // Rule switch: a fresh scenario for another
+                        // executable rule, still rule-aware through its
+                        // own placements.
+                        let switch_rule = graph.rules.iter().find(|r| r.name == child.target_rule).unwrap();
+                        assert!(switch_rule.runtime_blockers().is_empty(), "switched to a blocked rule");
+                        assert_eq!(lift_with(&input, switch_rule, &child.placements).unwrap().values, child.values);
+                        integration_switched += 1;
+                    }
                 }
             }
         } else {
@@ -107,6 +120,7 @@ fn main() {
     println!("{}",serde_json::json!({"loaded":graph.rules.len(),"executable":executable,
         "requires_binding_or_irq_only":blocked,"generated":generated,"mutated":mutated,"reasons":reasons,
         "integration_generated":integration_generated,"integration_mutated":integration_mutated,
+        "integration_switched":integration_switched,
         "documents_checked":documents_checked}));
     assert!(!graph.rules.is_empty());
 }

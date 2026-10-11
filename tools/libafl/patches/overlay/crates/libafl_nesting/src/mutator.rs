@@ -3,6 +3,7 @@ use core::num::NonZeroUsize;
 
 use libafl::{
     Error,
+    generators::Generator,
     mutators::{MutationResult, Mutator},
 };
 use libafl_bolts::{Named, nonzero, rands::Rand};
@@ -20,6 +21,13 @@ const U32_BYTES: usize = core::mem::size_of::<u32>();
 /// mutation is kept even when the SDG is non-empty, to explore outside the
 /// rule set. The decision draws from the fuzzer RNG, never from wall time.
 const RANDOM_MUTATION_PROBABILITY: NonZeroUsize = nonzero!(16);
+
+/// Rule switching: a deterministic probability replaces the input with a
+/// fresh scenario for a random executable rule, so rule selection is a
+/// first-class mutation and the corpus spans more of the rule space over
+/// time. Wire-only seeds without metadata take this path too, entering the
+/// rule space instead of ending as dead-end wire mutants.
+const RULE_SWITCH_PROBABILITY: NonZeroUsize = nonzero!(4);
 
 /// The L1 stub caps each raw testcase at `MAX_ENCODED_SCENARIO_BYTES` and
 /// truncates anything longer, so a mutated scenario must stay within the
@@ -71,6 +79,11 @@ impl ScenarioMutator {
     /// Whether the documented §5.4 probability selects random wire mutation.
     fn selects_random_wire_mutation<R: Rand>(rand: &mut R) -> bool {
         rand.below(RANDOM_MUTATION_PROBABILITY) == 0
+    }
+
+    /// Whether the rule-switch probability selects a fresh random rule.
+    fn selects_rule_switch<R: Rand>(rand: &mut R) -> bool {
+        rand.below(RULE_SWITCH_PROBABILITY) == 0
     }
 
     /// The documented random wire-format mutation: skeleton metadata (the
@@ -292,6 +305,19 @@ where
                 return Ok(mutation_result(&original, input, mutated));
             }
 
+            // Rule switching: replace the input with a fresh scenario for a
+            // random executable rule. The generator validates, lowers, and
+            // registers the fresh scenario's metadata for the new bytes, so
+            // the switch also lets wire-only seeds without metadata enter
+            // the rule space. A failed generation falls through to the
+            // rule-aware mutation below.
+            if Self::selects_rule_switch(state.rand_mut()) {
+                if let Ok(fresh) = self.generator.generate(state) {
+                    *input = fresh;
+                    return Ok(mutation_result(&original, input, true));
+                }
+            }
+
             // Rule-aware path: look up the metadata recorded for these
             // exact bytes, mutate that exact semantic scenario, re-lower at
             // the stored placement, and register the child scenario for the
@@ -459,6 +485,19 @@ mod tests {
         let first_before = input.dma.coherent[0].clone();
         let mut mutated_any = false;
         for attempt in 0..64u64 {
+            let branch = {
+                let mut probe = StdRand::with_seed(100 + attempt);
+                if ScenarioMutator::selects_random_wire_mutation(&mut probe) {
+                    0
+                } else if ScenarioMutator::selects_rule_switch(&mut probe) {
+                    1
+                } else {
+                    2
+                }
+            };
+            if branch != 2 {
+                continue;
+            }
             let mut candidate = input.clone();
             let mut state = TestState { rand: StdRand::with_seed(100 + attempt) };
             if mutator
@@ -548,6 +587,19 @@ mod tests {
         let first_before = input.dma.streaming[0].clone();
         let mut mutated_any = false;
         for attempt in 0..64u64 {
+            let branch = {
+                let mut probe = StdRand::with_seed(200 + attempt);
+                if ScenarioMutator::selects_random_wire_mutation(&mut probe) {
+                    0
+                } else if ScenarioMutator::selects_rule_switch(&mut probe) {
+                    1
+                } else {
+                    2
+                }
+            };
+            if branch != 2 {
+                continue;
+            }
             let mut candidate = input.clone();
             let mut state = TestState { rand: StdRand::with_seed(200 + attempt) };
             if mutator
@@ -728,7 +780,7 @@ mod tests {
         );
         let sdg = crate::sdg::SemanticDependencyGraph { rules: vec![rule] };
         let generator = ScenarioGenerator::with_sdg(sdg);
-        let mut mutator = ScenarioMutator::new(generator);
+        let mut mutator = ScenarioMutator::new(generator.clone());
 
         // A wire-format seed whose word model happens to hold a value that
         // satisfies the trigger: without metadata this must never be
@@ -737,20 +789,37 @@ mod tests {
             MmioSection { word_models: vec![word(0x100, &[41])] },
             crate::input::DmaSection::default(),
         );
+        let mut switched = false;
         for seed in 0..64u64 {
             let mut state = TestState { rand: StdRand::with_seed(seed) };
             let mut candidate = input.clone();
             let result = mutator.mutate(&mut state, &mut candidate).unwrap();
-            let random_branch = {
+            let branch = {
                 let mut probe = StdRand::with_seed(seed);
-                ScenarioMutator::selects_random_wire_mutation(&mut probe)
+                if ScenarioMutator::selects_random_wire_mutation(&mut probe) {
+                    0
+                } else if ScenarioMutator::selects_rule_switch(&mut probe) {
+                    1
+                } else {
+                    2
+                }
             };
-            if !random_branch {
-                assert_eq!(result, libafl::mutators::MutationResult::Skipped,
-                           "wire-only seeds must never be rule-aware mutated");
-                assert_eq!(candidate, input, "an unmutated seed keeps its bytes");
+            match branch {
+                2 => {
+                    assert_eq!(result, libafl::mutators::MutationResult::Skipped,
+                               "wire-only seeds must never be rule-aware mutated");
+                    assert_eq!(candidate, input, "an unmutated seed keeps its bytes");
+                }
+                1 => {
+                    assert_eq!(result, libafl::mutators::MutationResult::Mutated);
+                    assert!(generator.metadata().lookup(&candidate).is_some(),
+                            "a switched input carries the fresh scenario metadata");
+                    switched = true;
+                }
+                _ => {}
             }
         }
+        assert!(switched, "the rule-switch branch must be reachable with fixed seeds");
     }
 
     #[test]
@@ -783,18 +852,25 @@ mod tests {
         let mut mutator = clone_shared(&generator);
         for seed in 0..64u64 {
             let mut state = TestState { rand: StdRand::with_seed(seed) };
-            let random_branch = {
+            let branch = {
                 let mut probe = StdRand::with_seed(seed);
-                ScenarioMutator::selects_random_wire_mutation(&mut probe)
+                if ScenarioMutator::selects_random_wire_mutation(&mut probe) {
+                    0
+                } else if ScenarioMutator::selects_rule_switch(&mut probe) {
+                    1
+                } else {
+                    2
+                }
             };
-            if !random_branch {
-                let mut candidate = input.clone();
-                assert_eq!(
-                    mutator.mutate(&mut state, &mut candidate).unwrap(),
-                    libafl::mutators::MutationResult::Skipped,
-                    "stale metadata must be rejected, never applied"
-                );
+            if branch != 2 {
+                continue;
             }
+            let mut candidate = input.clone();
+            assert_eq!(
+                mutator.mutate(&mut state, &mut candidate).unwrap(),
+                libafl::mutators::MutationResult::Skipped,
+                "stale metadata must be rejected, never applied"
+            );
         }
     }
 
@@ -1006,19 +1082,98 @@ mod tests {
         for seed in 0..64u64 {
             let mut state = TestState { rand: StdRand::with_seed(seed) };
             let mut candidate = input.clone();
-            let random_branch = {
+            let branch = {
                 let mut probe = StdRand::with_seed(seed);
-                ScenarioMutator::selects_random_wire_mutation(&mut probe)
+                if ScenarioMutator::selects_random_wire_mutation(&mut probe) {
+                    0
+                } else if ScenarioMutator::selects_rule_switch(&mut probe) {
+                    1
+                } else {
+                    2
+                }
             };
-            if !random_branch {
-                assert_eq!(
-                    mutator.mutate(&mut state, &mut candidate).unwrap(),
-                    libafl::mutators::MutationResult::Skipped,
-                    "foreign seeds without a sidecar must not be rule-aware mutated"
-                );
-                assert_eq!(candidate, input, "an unmutated seed keeps its bytes");
+            if branch != 2 {
+                continue;
             }
+            assert_eq!(
+                mutator.mutate(&mut state, &mut candidate).unwrap(),
+                libafl::mutators::MutationResult::Skipped,
+                "foreign seeds without a sidecar must not be rule-aware mutated"
+            );
+            assert_eq!(candidate, input, "an unmutated seed keeps its bytes");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn rule_switch_replaces_the_scenario_with_a_random_other_rule() {
+        // The rule-switch branch replaces the input with a fresh scenario
+        // for a random executable rule and registers the fresh scenario's
+        // metadata for the new bytes, so the corpus spans more of the rule
+        // space over time.
+        use crate::generator::ScenarioGenerator;
+        use libafl::generators::Generator;
+
+        let rule_a = parse_rule_text(
+            "rule rule:alpha|target:mmio:256:1:x|predicate:gt:unsigned:40\n\
+             node mmio:256:1:x mmio 0x100 1\n\
+             trigger mmio:256:1:x head_bound gt unsigned 40\n\
+             mutation set_boundary above\n",
+        );
+        let rule_b = parse_rule_text(
+            "rule rule:beta|target:mmio:260:1:y|predicate:gt:unsigned:40\n\
+             node mmio:260:1:y mmio 0x104 1\n\
+             trigger mmio:260:1:y head_bound gt unsigned 40\n\
+             mutation set_boundary above\n",
+        );
+        let sdg = crate::sdg::SemanticDependencyGraph { rules: vec![rule_a, rule_b] };
+        let mut generator = ScenarioGenerator::with_sdg(sdg);
+        let mut parent_state = TestState { rand: StdRand::with_seed(0) };
+        let input = generator
+            .generate(&mut parent_state)
+            .expect("generation should satisfy the parent rule");
+        let parent_rule = generator
+            .metadata()
+            .lookup(&input)
+            .expect("the parent has metadata")
+            .target_rule
+            .clone();
+
+        let mut mutator = clone_shared(&generator);
+        let mut switched = false;
+        let mut switched_rules = std::collections::BTreeSet::new();
+        for seed in 0..256u64 {
+            let branch = {
+                let mut probe = StdRand::with_seed(seed);
+                if ScenarioMutator::selects_random_wire_mutation(&mut probe) {
+                    0
+                } else if ScenarioMutator::selects_rule_switch(&mut probe) {
+                    1
+                } else {
+                    2
+                }
+            };
+            if branch != 1 {
+                continue;
+            }
+            let mut state = TestState { rand: StdRand::with_seed(seed) };
+            let mut candidate = input.clone();
+            if mutator.mutate(&mut state, &mut candidate).unwrap()
+                != libafl::mutators::MutationResult::Mutated
+            {
+                continue;
+            }
+            let child = generator
+                .metadata()
+                .lookup(&candidate)
+                .expect("a switched input carries the fresh scenario metadata");
+            switched_rules.insert(child.target_rule.clone());
+            switched = true;
+        }
+        assert!(switched, "the rule-switch branch must be reachable with fixed seeds");
+        assert!(
+            switched_rules.iter().any(|rule| rule != &parent_rule),
+            "a switch must be able to leave the parent rule: {switched_rules:?}"
+        );
     }
 }
