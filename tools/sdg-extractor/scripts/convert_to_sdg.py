@@ -1,433 +1,291 @@
 #!/usr/bin/env python3
-"""Convert sdg-rules.json into one .sdg text file per rule.
-
-The .sdg format consumed by libafl is a line-oriented rule file:
-
-    rule <canonical rule id, preserved verbatim>
-    node <node-id> mmio <offset> <size>
-    node <node-id> coherent <offset> <size>
-    node <node-id> streaming <slot> <offset> <size>
-    precondition <src-node-id> <dst-node-id> <head> <op> [<signedness>] <value...>
-    trigger <node-id> <head> <op> [<signedness>] <value...>
-    mutation <operator> [<value>]
-
-Condition lines keep the full canonical edge identity: source node,
-destination node, head, and predicate. Surfaces are derived from the source
-class:
-    Mmio  -> mmio
-    Dma + coherent  -> coherent
-    Dma + streaming -> streaming
-Unsupported or physically unresolved sources are rejected.
-
-Relational predicates with Unknown (or missing) signedness are expanded into
-one signed and one unsigned rule candidate before serialization; neither is
-silently chosen over the other.
-"""
+"""Export complete version 1.2 semantic dependency graphs as self-contained .sdg files."""
 
 import argparse
-import copy
+from collections import Counter
 import hashlib
 import json
-import os
 from pathlib import Path
+import re
+import sys
 
-TRIGGER_OPS = {
-    "Eq": "eq",
-    "Ne": "ne",
-    "Gt": "gt",
-    "Lt": "lt",
-    "Ge": "ge",
-    "Le": "le",
-    "BitSet": "bit_set",
-    "BitClear": "bit_clear",
-    "InRange": "in_range",
-}
 
-RELATIONAL_KINDS = {"Lt", "Gt", "Le", "Ge", "InRange"}
-
-MUTATION_OPS = {
-    "SetValue": "set_value",
-    "SetBoundary": "set_boundary",
-    "SetBits": "set_bits",
-    "ClearBits": "clear_bits",
-    "SampleRange": "sample_range",
-    "FlipBit": "flip_bit",
-    "Inc": "inc",
-    "Dec": "dec",
-    "Keep": "keep",
-}
-
+VERSION = "1.2"
 HEADS = {"head_guard", "head_dataflow", "head_bound", "head_offset", "head_call"}
 
-MAX_ACCESS_BYTES = 8
+
+def token(value):
+    if not isinstance(value, str) or not value or any(character.isspace() for character in value):
+        raise ValueError(f"invalid record identifier: {value!r}")
+    return value
 
 
-def sanitize_filename(name: str) -> str:
-    # Only for filenames; the canonical rule id inside the file is verbatim.
-    return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+def encode(value):
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
-def region_for_source(src: dict) -> str:
-    clazz = src.get("class", "")
-    kind = src.get("access_kind", "")
-    if clazz == "Dma":
-        return "coherent" if kind == "coherent" else "streaming"
-    if clazz == "Mmio":
-        return "mmio"
-    raise ValueError(f"source class {clazz or '<missing>'} is not physically lowerable")
+def index_records(records, kind):
+    indexed = {}
+    for record in records:
+        identity = token(record["id"])
+        if identity in indexed:
+            raise ValueError(f"duplicate {kind}: {identity}")
+        indexed[identity] = record
+    return indexed
 
 
-def slot_for_source(src: dict) -> int:
-    slot = src.get("slot")
-    if slot is None:
-        raise ValueError("streaming source has no protocol slot")
-    return int(slot)
+def node_references(value):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key in {"node", "src", "dst", "var"} and isinstance(child, str):
+                yield child
+            else:
+                yield from node_references(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from node_references(child)
 
 
-def size_for_source(src: dict) -> int:
-    return int(src.get("size_bytes") or src.get("width_bytes") or 0)
+def validate_graph(rule, nodes, edges):
+    token(rule["id"])
+    variables = rule.get("vars")
+    if not isinstance(variables, list) or any(not isinstance(item, str) for item in variables):
+        raise ValueError("version 1.2 vars must contain node IDs")
+    declared = set(variables)
+    if len(declared) != len(variables):
+        raise ValueError("duplicate rule variable")
+    missing_nodes = declared - nodes.keys()
+    if missing_nodes:
+        raise ValueError("missing node: " + min(missing_nodes))
+    for identity in declared:
+        node = nodes[identity]
+        if node.get("id") != identity or node.get("kind") not in {"source", "internal", "sink"}:
+            raise ValueError("invalid node record: " + identity)
+    path = rule["path"]
+    edge_ids = path["edges"]
+    if not isinstance(edge_ids, list) or any(not isinstance(item, str) for item in edge_ids):
+        raise ValueError("version 1.2 path.edges must contain edge IDs")
+    if len(edge_ids) != len(set(edge_ids)):
+        raise ValueError("duplicate path edge")
+    missing_edges = set(edge_ids) - edges.keys()
+    if missing_edges:
+        raise ValueError("missing edge: " + min(missing_edges))
+    required = {path["source"], path["sink"]}
+    required.update(node_references(rule))
+    required.update(path.get("source_observations", []))
+    required.update(path.get("alternatives", {}).get("nodes", []))
+    for context in path.get("equivalent_contexts", []):
+        required.update(context["witness_nodes"])
+    validation = rule.get("validation", {})
+    required.update(validation.get("source_assignments", {}))
+    required.update(validation.get("assumed_internal_values", {}))
+    required.update(validation.get("internal_state_witness", {}))
+    for identity in declared:
+        required.update(nodes[identity].get("expressions", []))
+    for identity in edge_ids:
+        edge = edges[identity]
+        if edge.get("id") != identity or edge.get("head") not in HEADS or not edge.get("predicate"):
+            raise ValueError("invalid edge record: " + identity)
+        required.update((edge["src"], edge["dst"]))
+        required.update(node_references(edge))
+    target = rule["target_state"]
+    if target.get("head") not in HEADS or not target.get("predicate"):
+        raise ValueError("invalid target edge")
+    required.update((target["src"], target["dst"]))
+    if required - declared:
+        raise ValueError("undeclared node reference: " + min(required - declared))
+    if nodes[path["source"]]["kind"] != "source" or nodes[path["sink"]]["kind"] != "sink":
+        raise ValueError("invalid source or sink endpoint kind")
+    for hint in rule.get("mutation_hint", []):
+        if nodes[hint["var"]]["kind"] != "source":
+            raise ValueError("mutation destination is not a source: " + hint["var"])
 
 
-def signed_value(pattern: int, width_bits: int) -> int:
-    """Two-complement interpretation of a width-limited bit pattern."""
-    if width_bits <= 0 or width_bits > 64:
-        raise ValueError(f"invalid width {width_bits}")
-    if pattern >= (1 << (width_bits - 1)):
-        return pattern - (1 << width_bits)
-    return pattern
-
-
-def condition_tokens(pred: dict) -> list:
-    """Predicate tokens shared by trigger and precondition lines."""
-    kind = pred.get("kind")
-    op = TRIGGER_OPS.get(kind)
-    if op is None:
-        raise ValueError(f"predicate kind {kind or '<missing>'} is not serializable")
-    tokens = [op]
-    if kind in {"BitSet", "BitClear"}:
-        bit = pred.get("bit")
-        if bit is None:
-            raise ValueError(f"{kind} predicate has no bit")
-        tokens.append(str(bit))
-    elif kind == "InRange":
-        signedness = pred.get("signedness")
-        if signedness not in {"Signed", "Unsigned"}:
-            raise ValueError("InRange signedness is not resolved")
-        tokens.append(signedness.lower())
-        tokens.extend([str(pred.get("min", 0)), str(pred.get("max", 0))])
-    elif kind in RELATIONAL_KINDS:
-        signedness = pred.get("signedness")
-        if signedness not in {"Signed", "Unsigned"}:
-            raise ValueError(f"{kind} signedness is not resolved")
-        tokens.append(signedness.lower())
-        tokens.append(str(pred.get("value", 0)))
-    else:
-        tokens.append(str(pred.get("value", 0)))
-    return tokens
-
-
-def predicate_is_valid(pred: dict, src: dict) -> bool:
-    kind = pred.get("kind")
-    size = size_for_source(src)
-    if size <= 0 or size > MAX_ACCESS_BYTES:
-        return False
-    width = size * 8
-    if kind in {"BitSet", "BitClear"}:
-        bit = pred.get("bit")
-        return isinstance(bit, int) and 0 <= bit < width
-    if kind == "InRange":
-        minimum = pred.get("min")
-        maximum = pred.get("max")
-        if not (isinstance(minimum, int) and isinstance(maximum, int)):
-            return False
-        if not (0 <= minimum < (1 << width) and 0 <= maximum < (1 << width)):
-            return False
-        if pred.get("signedness") == "Signed":
-            return signed_value(minimum, width) <= signed_value(maximum, width)
-        return minimum <= maximum
-    value = pred.get("value")
-    return isinstance(value, int) and 0 <= value < (1 << width)
-
-
-def format_condition(keyword: str, edge: dict) -> str:
-    head = edge.get("head", "")
-    if head not in HEADS:
-        raise ValueError(f"edge head {head or '<missing>'} is unknown")
-    pred = edge.get("predicate", {})
-    parts = [keyword, edge.get("src", ""), edge.get("dst", ""), head]
-    parts.extend(condition_tokens(pred))
-    return " ".join(parts)
-
-
-def format_trigger(edge: dict) -> str:
-    src = edge.get("src", "")
-    dst = edge.get("dst", "")
-    if src != dst:
-        raise ValueError("target state is not a self-edge")
-    head = edge.get("head", "")
-    if head not in HEADS:
-        raise ValueError(f"edge head {head or '<missing>'} is unknown")
-    parts = ["trigger", dst, head]
-    parts.extend(condition_tokens(edge.get("predicate", {})))
-    return " ".join(parts)
-
-
-def format_mutation(mut: dict, target_var: str) -> str:
-    op = MUTATION_OPS.get(mut.get("operator", ""))
-    if op is None:
-        raise ValueError(f"mutation operator {mut.get('operator') or '<missing>'} is unknown")
-    # The mutation var must match the rule's target variable exactly.
-    var = mut.get("var")
-    if var is not None and var != target_var:
-        raise ValueError(f"mutation var {var} does not match the target variable {target_var}")
-    parts = [op]
-    if op == "sample_range":
-        parts.extend([str(mut["min"]), str(mut["max"])])
-    elif op == "set_boundary":
-        side = str(mut.get("side", "")).lower()
-        if side not in {"above", "below", "min", "max"}:
-            raise ValueError(f"set_boundary side {side or '<missing>'} is unknown")
-        parts.append(side)
-    elif op == "keep":
-        pass
-    elif op in ("set_bits", "clear_bits"):
-        mask = mut.get("mask")
-        if mask is None:
-            mask = mut.get("value")
-        if mask is None:
-            raise ValueError(f"{mut.get('operator')} has no mask")
-        parts.append(str(mask))
-    elif op in ("inc", "dec"):
-        delta = mut.get("delta")
-        if delta is None:
-            delta = mut.get("value")
-        if delta is None:
-            raise ValueError(f"{mut.get('operator')} has no delta")
-        parts.append(str(delta))
-    elif op == "flip_bit":
-        bit = mut.get("bit")
-        if bit is None:
-            raise ValueError("FlipBit has no bit")
-        parts.append(str(bit))
-    else:
-        value = mut.get("value")
-        if value is None:
-            raise ValueError(f"{mut.get('operator')} has no value")
-        parts.append(str(value))
-    return "mutation " + " ".join(parts)
-
-
-def predicate_text(pred: dict) -> str:
-    """Canonical predicate serialization from the SDG document: decimal
-    values without leading zeroes and explicit signedness for relational
-    predicates."""
-    kind = pred.get("kind")
-    if kind in {"BitSet", "BitClear"}:
-        return f"{TRIGGER_OPS[kind]}:{pred.get('bit', 0)}"
-    if kind == "InRange":
-        signedness = pred.get("signedness", "Unknown")
-        return f"in_range:{signedness.lower()}:{pred.get('min', 0)}:{pred.get('max', 0)}"
-    if kind in {"Eq", "Ne"}:
-        return f"{kind.lower()}:{pred.get('value', 0)}"
-    signedness = pred.get("signedness", "Unknown")
-    return f"{kind.lower()}:{signedness.lower()}:{pred.get('value', 0)}"
-
-
-def canonical_rule_id(rule: dict) -> str:
-    trigger = rule.get("target_state", rule.get("trigger", {}))
-    return (
-        f"rule:{rule.get('function', '')}"
-        f"|target:{trigger.get('dst', '')}"
-        f"|predicate:{predicate_text(trigger.get('predicate', {}))}"
-    )
-
-
-def pred_is_unresolved(pred: dict) -> bool:
-    return pred.get("kind") in RELATIONAL_KINDS and pred.get("signedness") not in ("Signed", "Unsigned")
-
-
-def expand_precondition_candidates(rule: dict) -> list:
-    """Replace every unresolved precondition with its signed and unsigned
-    candidate lines. The candidates are alternatives: the runtime
-    at-least-one rule is satisfied by either candidate, so all independent
-    signed/unsigned combinations are represented without creating extra
-    rules or corrupting canonical ids."""
-    preconditions = rule.get("preconditions", [])
-    expanded = []
-    for pre in preconditions:
-        pred = pre.get("predicate", {})
-        if pred_is_unresolved(pred):
-            for signedness in ("Signed", "Unsigned"):
-                candidate = copy.deepcopy(pre)
-                candidate["predicate"]["signedness"] = signedness
-                expanded.append(candidate)
-        else:
-            expanded.append(pre)
-    rule["preconditions"] = expanded
-    return rule
-
-
-def expand_unknown_signedness(rule: dict) -> list:
-    """Expand Unknown relational signedness. A target-state predicate
-    determines the canonical rule id, so its expansion produces two rule
-    candidates with distinct ids. A precondition's expansion produces
-    alternative candidate lines inside each rule, so it never creates extra
-    rules or identity conflicts. No signedness is ever silently chosen."""
-    target_pred = rule.get("target_state", {}).get("predicate", {})
-    if not pred_is_unresolved(target_pred):
-        # Only preconditions may be unresolved.
-        variant = copy.deepcopy(rule)
-        expand_precondition_candidates(variant)
-        return [(variant, rule.get("id"))]
-    variants = []
-    for signedness in ("Signed", "Unsigned"):
-        variant = copy.deepcopy(rule)
-        variant["target_state"]["predicate"]["signedness"] = signedness
-        expand_precondition_candidates(variant)
-        variant["id"] = canonical_rule_id(variant)
-        variants.append((variant, variant["id"]))
-    return variants
-
-
-def convert_rule(rule: dict) -> str:
-    rule_id = rule.get("id")
-    if not rule_id:
-        raise ValueError("rule has no canonical id")
-    lines = [f"rule {rule_id}"]
-    vars_by_id = {var.get("id"): var for var in rule.get("vars", [])}
-    trigger = rule.get("target_state", rule.get("trigger", {}))
-    trigger_id = trigger.get("src", "")
-    trigger_var = vars_by_id.get(trigger_id)
-    if trigger_var is None or not predicate_is_valid(
-        trigger.get("predicate", {}), trigger_var.get("source", {})
-    ):
-        raise ValueError("target state is not valid for its node width")
-
-    valid_preconditions = []
-    for precondition in rule.get("preconditions", []):
-        var = vars_by_id.get(precondition.get("src"))
-        if var is None:
-            continue
-        src = var.get("source", {})
-        pred = precondition.get("predicate", {})
-        # Internal-state preconditions are expanded to their physical origins,
-        # preserving OR/PHI/select disjunctions as multiple independent
-        # precondition lines.
-        if src.get("class") == "InternalState":
-            origins = src.get("origins", [])
-            if not origins:
-                continue
-            for origin_id in origins:
-                origin_var = vars_by_id.get(origin_id)
-                if origin_var is None:
-                    continue
-                origin_src = origin_var.get("source", {})
-                try:
-                    region_for_source(origin_src)
-                except ValueError:
-                    continue
-                if predicate_is_valid(pred, origin_src):
-                    expanded = precondition.copy()
-                    expanded["src"] = origin_id
-                    valid_preconditions.append(expanded)
-            continue
-        try:
-            region_for_source(src)
-        except ValueError:
-            continue
-        if predicate_is_valid(pred, src):
-            valid_preconditions.append(precondition)
-    if rule.get("preconditions") and not valid_preconditions:
-        raise ValueError("no physically resolvable precondition remains")
-
-    needed_ids = {trigger_id}
-    needed_ids.update(edge.get("src") for edge in valid_preconditions)
-    for var in rule.get("vars", []):
-        if var.get("id") not in needed_ids:
-            continue
-        src = var.get("source", {})
-        var_id = var.get("id", "var")
-        region = region_for_source(src)
-        slot = slot_for_source(src) if region == "streaming" else 0
-        off = src.get("offset")
-        if off is None:
-            raise ValueError(f"node {var_id} has no physical offset")
-        off_dec = int(off)
-        size = size_for_source(src)
-        if size <= 0 or size > MAX_ACCESS_BYTES:
-            raise ValueError(f"node {var_id} has invalid access width {size}")
-        if region == "mmio":
-            lines.append(f"node {var_id} mmio 0x{off_dec:x} {size}")
-        elif region == "coherent":
-            lines.append(f"node {var_id} coherent 0x{off_dec:x} {size}")
-        else:
-            lines.append(f"node {var_id} streaming {slot} 0x{off_dec:x} {size}")
-
-    for precondition in valid_preconditions:
-        lines.append(format_condition("precondition", precondition))
-    lines.append(format_trigger(trigger))
-    lines.append(format_mutation(rule.get("mutation", {}), trigger.get("dst", "")))
+def render_sdg(rule, nodes, edges):
+    validate_graph(rule, nodes, edges)
+    lines = ["sdg " + VERSION, "rule " + token(rule["id"])]
+    for key in sorted(rule.keys() - {"id"}):
+        lines.append(f"field {token(key)} {encode(rule[key])}")
+    for identity in sorted(rule["vars"]):
+        node = nodes[identity]
+        metadata = {key: value for key, value in node.items() if key not in {"id", "kind"}}
+        lines.append(f"node {token(identity)} {node['kind']} {encode(metadata)}")
+    for identity in sorted(rule["path"]["edges"]):
+        edge = edges[identity]
+        metadata = {key: value for key, value in edge.items() if key not in {"id", "src", "dst", "head"}}
+        lines.append(f"edge {token(identity)} {token(edge['src'])} {token(edge['dst'])} "
+                     f"{edge['head']} {encode(metadata)}")
     return "\n".join(lines) + "\n"
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Convert SDG JSON to .sdg files")
-    parser.add_argument("--rules", required=True, type=Path, help="sdg-rules.json")
-    parser.add_argument("--output", required=True, type=Path, help="output directory")
-    args = parser.parse_args()
-
-    with open(args.rules) as f:
-        data = json.load(f)
-
-    raw_rules = data.get("rules", [])
-    if isinstance(raw_rules, dict):
-        rules = raw_rules.get("rules", [])
-    else:
-        rules = raw_rules
-    os.makedirs(args.output, exist_ok=True)
-
-    # Detect identity conflicts before writing anything: duplicate canonical
-    # rule ids are never resolved by container order.
-    seen_ids = {}
-    conflicts = []
-    pending = []
-    for rule in rules:
-        rid = rule.get("id", "")
-        for variant, variant_id in expand_unknown_signedness(rule):
-            if not variant_id:
-                pending.append((variant, variant_id))
-                continue
-            if variant_id in seen_ids:
-                conflicts.append(variant_id)
-                print(f"identity conflict: duplicate canonical rule id {variant_id}")
-                continue
-            seen_ids[variant_id] = True
-            pending.append((variant, variant_id))
-
-    if conflicts:
-        raise SystemExit(f"SDG rule identity conflicts: {sorted(set(conflicts))}")
-
-    written = 0
-    skipped = 0
-    for variant, variant_id in pending:
-        if not variant_id:
-            skipped += 1
-            print(f"skipping {variant.get('id', '')}: rule has no canonical id")
+def parse_sdg(text):
+    lines = text.splitlines()
+    if not lines or lines[0] != "sdg " + VERSION:
+        raise ValueError("expected sdg 1.2 header")
+    rule, nodes, edges = {}, {}, {}
+    for line_number, line in enumerate(lines[1:], 2):
+        if not line.strip():
             continue
-        digest = hashlib.sha256(variant_id.encode()).hexdigest()[:12]
-        fname = f"{sanitize_filename(variant_id)}-{digest}.sdg"
-        out_path = args.output / fname
+        kind = line.partition(" ")[0]
         try:
-            rendered = convert_rule(variant)
-        except ValueError as exc:
-            skipped += 1
-            print(f"skipping {variant_id}: {exc}")
-            continue
-        out_path.write_text(rendered)
-        written += 1
+            if kind == "rule":
+                if "id" in rule:
+                    raise ValueError("duplicate rule")
+                rule["id"] = token(line.split(" ", 1)[1])
+            elif kind == "field":
+                _, name, payload = line.split(" ", 2)
+                token(name)
+                if name == "id" or name in rule:
+                    raise ValueError("duplicate field: " + name)
+                rule[name] = json.loads(payload)
+            elif kind == "node":
+                _, identity, node_kind, payload = line.split(" ", 3)
+                token(identity)
+                if identity in nodes:
+                    raise ValueError("duplicate node: " + identity)
+                metadata = json.loads(payload)
+                if not isinstance(metadata, dict) or {"id", "kind"} & metadata.keys():
+                    raise ValueError("invalid node metadata")
+                nodes[identity] = {"id": identity, "kind": node_kind, **metadata}
+            elif kind == "edge":
+                _, identity, source, destination, head, payload = line.split(" ", 5)
+                token(identity)
+                if identity in edges:
+                    raise ValueError("duplicate edge: " + identity)
+                metadata = json.loads(payload)
+                if not isinstance(metadata, dict) or {"id", "src", "dst", "head"} & metadata.keys():
+                    raise ValueError("invalid edge metadata")
+                edges[identity] = {"id": identity, "src": token(source), "dst": token(destination),
+                                   "head": head, **metadata}
+            else:
+                raise ValueError("unknown record: " + kind)
+        except (ValueError, IndexError) as error:
+            raise ValueError(f"line {line_number}: {error}") from error
+    validate_graph(rule, nodes, edges)
+    if set(nodes) != set(rule["vars"]) or set(edges) != set(rule["path"]["edges"]):
+        raise ValueError("graph has records outside the rule")
+    return {"version": VERSION, "rule": rule,
+            "nodes": [nodes[key] for key in sorted(nodes)],
+            "edges": [edges[key] for key in sorted(edges)]}
 
-    print(f"wrote {written} .sdg files to {args.output} (skipped {skipped})")
+
+def filename(rule_id):
+    return "rule-" + hashlib.sha256(rule_id.encode()).hexdigest() + ".sdg"
+
+
+def repackage(source, destination, old_record, rule):
+    """Hash-check a previous semantic export and retain its exact graph records."""
+    old_hash, new_hash = hashlib.sha256(), hashlib.sha256()
+    temporary = destination.with_suffix(".tmp")
+    with source.open("rb") as reader, temporary.open("wb") as writer:
+        def emit(data):
+            writer.write(data)
+            new_hash.update(data)
+        emit(("sdg 1.2\nrule " + rule["id"] + "\n").encode())
+        for key in sorted(rule.keys() - {"id"}):
+            emit((f"field {key} {encode(rule[key])}\n").encode())
+        body = False
+        for line in reader:
+            old_hash.update(line)
+            if line.startswith((b"node ", b"edge ")):
+                body = True
+            if body:
+                emit(line)
+    if old_hash.hexdigest() != old_record["sha256"]:
+        temporary.unlink()
+        raise ValueError("original export hash mismatch: " + str(source))
+    temporary.replace(destination)
+    return {**old_record, "status": rule["status"], "sha256": new_hash.hexdigest()}
+
+
+def export_rules(rules, nodes, edges, output):
+    indexed_rules = index_records(rules, "rule")
+    return export_rule_stream(lambda: iter(indexed_rules.values()), nodes, edges, output)
+
+
+def export_rule_stream(records, nodes, edges, output):
+    identities = set()
+    for rule in records():
+        if rule["id"] in identities:
+            raise ValueError("duplicate rule: " + rule["id"])
+        identities.add(rule["id"])
+        validate_graph(rule, nodes, edges)
+    output = Path(output)
+    manifest_path = output / "manifest.json"
+    previous = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+    if previous and previous.get("format") != "semantic-sdg":
+        raise ValueError("output directory belongs to another exporter")
+    output.mkdir(parents=True, exist_ok=True)
+    manifest_records = []
+    for rule in records():
+        identity = rule["id"]
+        name = filename(identity)
+        rendered = render_sdg(rule, nodes, edges)
+        restored = parse_sdg(rendered)
+        if (restored["rule"] != rule or
+                {node["id"]: node for node in restored["nodes"]} != {key: nodes[key] for key in rule["vars"]} or
+                {edge["id"]: edge for edge in restored["edges"]} != {key: edges[key] for key in rule["path"]["edges"]}):
+            raise ValueError("SDG round-trip mismatch: " + identity)
+        temporary = output / (name + ".tmp")
+        temporary.write_text(rendered, encoding="utf-8")
+        temporary.replace(output / name)
+        cross_count = sum(edges[key]["src"] != edges[key]["dst"] for key in rule["path"]["edges"])
+        manifest_records.append({"id": identity, "status": rule["status"], "file": name,
+                        "sha256": hashlib.sha256(rendered.encode()).hexdigest(),
+                        "nodes": len(rule["vars"]), "cross_edges": cross_count,
+                        "self_edges": len(rule["path"]["edges"]) - cross_count,
+                        "target_edges": 1})
+    manifest_records.sort(key=lambda record: record["id"])
+    manifest = {"version": VERSION, "format": "semantic-sdg", "count": len(manifest_records),
+                "statuses": dict(Counter(record["status"] for record in manifest_records)),
+                "rules": manifest_records}
+    temporary = manifest_path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(manifest_path)
+    current_files = {record["file"] for record in manifest_records}
+    for record in previous.get("rules", []):
+        name = record.get("file", "")
+        if re.fullmatch(r"rule-[0-9a-f]{64}\.sdg", name) and name not in current_files:
+            (output / name).unlink(missing_ok=True)
+    return manifest
+
+
+def read_artifact(path):
+    artifact = json.loads(Path(path).read_text(encoding="utf-8"))
+    if artifact.get("version") != VERSION:
+        raise ValueError(f"{path}: expected version 1.2 query artifact")
+    return artifact
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--rules", required=True, type=Path)
+    parser.add_argument("--nodes", type=Path)
+    parser.add_argument("--edges", type=Path)
+    parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--rule-id", action="append", default=[])
+    arguments = parser.parse_args()
+    try:
+        rules = read_artifact(arguments.rules)["rules"]
+        indexed_rules = index_records(rules, "rule")
+        if arguments.rule_id:
+            missing = set(arguments.rule_id) - indexed_rules.keys()
+            if missing:
+                raise ValueError("rule IDs not found: " + ", ".join(sorted(missing)))
+            rules = [indexed_rules[identity] for identity in sorted(set(arguments.rule_id))]
+        nodes_file = arguments.nodes or arguments.rules.with_name("sdg-nodes.json")
+        edges_file = arguments.edges or arguments.rules.with_name("sdg-edges.json")
+        nodes = index_records(read_artifact(nodes_file)["nodes"], "node")
+        raw_edges = read_artifact(edges_file)
+        edges = index_records(raw_edges["self_edges"] + raw_edges["cross_edges"], "edge")
+        manifest = export_rules(rules, nodes, edges, arguments.output)
+    except (ValueError, KeyError, TypeError, OSError) as error:
+        print(f"SDG export failed: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps({"count": manifest["count"], "statuses": manifest["statuses"],
+                      "manifest": str(arguments.output / "manifest.json")}, sort_keys=True))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

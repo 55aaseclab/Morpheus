@@ -1,0 +1,34 @@
+{
+  "version": 2,
+  "contracts": {
+    "alloc_etherdev_mqs": {
+      "return": "nonnull",
+      "reason": "Assume network-device allocation succeeds in the selected workload."
+    },
+    "devm_kzalloc": {
+      "return": "nonnull",
+      "reason": "Assume managed allocation succeeds in the selected workload."
+    },
+    "init_vqs": {
+      "return": "zero",
+      "reason": "Assume queue initialization completes successfully."
+    },
+    "virtnet_create_page_pools": {
+      "return": "zero",
+      "reason": "Assume receive page-pool initialization completes successfully."
+    },
+    "register_netdevice": {
+      "return": "zero",
+      "reason": "Assume network-device registration completes successfully."
+    }
+  },
+  "path_assumptions": {
+    "kinds": [
+      "kernel_path_condition",
+      "transport_callback",
+      "interrupt_delivery",
+      "memory"
+    ],
+    "reason": "Assume the explicitly listed kernel conditions of this path hold for the selected device inputs."
+  }
+}

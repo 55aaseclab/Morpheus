@@ -272,10 +272,17 @@
         ],
         "boolean": true
       },
-      "l2-dma-count": {
+      "sdg-rules": {
         "aliases": [
-          "l2-dma-count",
-          "l2DmaCount"
+          "sdg-rules",
+          "sdgRules"
+        ],
+        "path": true
+      },
+      "require-sdg": {
+        "aliases": [
+          "require-sdg",
+          "requireSdg"
         ],
         "boolean": true
       }
@@ -502,7 +509,10 @@
             "stop-on-login",
             "l2-dma-count",
             "build-version",
-            "build-dir-key"
+            "build-dir-key",
+            "sdg-rules",
+            "require-sdg",
+            "nvirsh-state"
           ],
           "repeatableFlags": [
             "harness-arg"

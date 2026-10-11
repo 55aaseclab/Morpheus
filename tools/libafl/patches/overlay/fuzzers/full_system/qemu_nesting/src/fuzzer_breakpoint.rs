@@ -62,6 +62,11 @@ fn scenario_generator_from_env(corpus_dir: &Path) -> ScenarioGenerator {
     let generator = ScenarioGenerator::from_env()
         .unwrap_or_else(|err| panic!("failed to load SDG rules: {err}"));
     let metadata_dir = sdg_metadata_dir(corpus_dir);
+    let (loaded, executable) = generator.rule_counts();
+    eprintln!("[libafl/qemu_nesting] SDG rules loaded={loaded} executable={executable} irq=ignored");
+    if env::var("MORPHEUS_LIBAFL_REQUIRE_SDG").is_ok_and(|v| v == "true") && executable == 0 {
+        panic!("grammar run requires at least one executable SDG rule");
+    }
     if env::var("MORPHEUS_LIBAFL_DISABLE_SDG").is_err() {
         eprintln!(
             "[libafl/qemu_nesting] semantic metadata sidecar={}",
@@ -339,6 +344,16 @@ pub fn fuzz() {
                             let input = initial_scenario_generator.generate(&mut state).unwrap();
                             state.corpus_mut().add(input.into()).unwrap();
                         }
+                    }
+                    // Imported seeds have no semantic provenance. Add generated
+                    // seeds so grammar mutation has exact source placements.
+                    if replay_inputs.is_none() && initial_inputs.is_some()
+                        && initial_scenario_generator.rule_counts().1 > 0 {
+                        for _ in 0..4 {
+                            let input = initial_scenario_generator.generate(&mut state).unwrap();
+                            state.corpus_mut().add(input.into()).unwrap();
+                        }
+                        eprintln!("[libafl/qemu_nesting] added 4 SDG seeds with semantic metadata");
                     }
                     eprintln!(
                         "[libafl/qemu_nesting] initial corpus entries={}",

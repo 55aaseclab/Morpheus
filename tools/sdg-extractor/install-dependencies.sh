@@ -58,3 +58,9 @@ fi
 mkdir -p "${bin_dir}"
 ln -sfn "${install_root}/codeql" "${bin_dir}/codeql"
 log "linked ${bin_dir}/codeql -> ${install_root}/codeql"
+
+tool_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python_env="${HOME}/.cache/hyperarm/sdg-extractor/python"
+python3 -m venv "${python_env}"
+"${python_env}/bin/python" -m pip install --requirement "${tool_root}/requirements.txt"
+"${python_env}/bin/python" -c 'import z3; print("Z3", z3.get_version_string())'

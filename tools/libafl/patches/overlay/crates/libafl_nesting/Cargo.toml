@@ -29,6 +29,7 @@ libvharness_sys = { workspace = true, features = ["aarch64"] }
 serde = { workspace = true, default-features = false, features = ["alloc", "derive"] }
 serde_json = { workspace = true, features = ["std"] }
 sha2 = { version = "0.10", default-features = false }
+flate2 = "1"
 
 [dev-dependencies]
 static_assertions = { workspace = true }

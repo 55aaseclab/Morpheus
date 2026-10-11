@@ -64,11 +64,21 @@ Setting `MORPHEUS_LIBAFL_DISABLE_SDG` to a truthy value forces plain mode
 even when a rule directory is named, so a plain evaluation stays plain
 regardless of an ambient rule variable in the caller's shell.
 
-Each rule declares semantic nodes, cross-edge preconditions, a self-edge
-trigger, and a mutation operator. Generation satisfies the declared
-preconditions and emits a `ScenarioInput`; mutation selects a rule and applies
-its operator to the corresponding modeled value while preserving the seed
-wire invariants.
+The directory may contain legacy scalar rules, full `sdg 1.2` exports, or a
+final `sdg-runtime-package`. Packages verify their file hashes and share
+execution plans; their evidence archive restores the original documents on
+inspection. Only external source values are lowered to the wire.
+
+Full semantic rules use source mutation hints and reject path predicates
+that evaluate to false. Unknown kernel prerequisites retain their recorded
+status; generation does not establish an exact target proof. Rules requiring
+unresolved source bindings are reported and excluded. IRQ actions are
+ignored. Empty or wholly blocked rule sets select random fallback unless the
+harness is configured with `MORPHEUS_LIBAFL_REQUIRE_SDG=true`.
+
+The harness logs loaded/executable rule counts. When initial seed files are
+provided in grammar mode, it also adds four generated semantic seeds so
+rule-aware mutation has metadata for corpus entries.
 
 ## Semantic metadata sidecar
 

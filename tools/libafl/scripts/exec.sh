@@ -32,7 +32,7 @@ run_seconds="${MORPHEUS_LIBAFL_RUN_SECONDS:-0}"
 result_file="${MORPHEUS_LIBAFL_RESULT_FILE:-${MORPHEUS_SCRIPT_RESULT_FILE:?}}"
 source "$(dirname "${BASH_SOURCE[0]}")/../../_shared/scripts/parallelism.sh"
 
-nvirsh_state=""
+nvirsh_state="${MORPHEUS_LIBAFL_NVIRSH_STATE:-}"
 l2_run_window_ms="${MORPHEUS_LIBAFL_L2_RUN_WINDOW_MS:-}"
 l2_mode="vm"
 l2_accel="auto"
@@ -49,6 +49,7 @@ capture_runtime="false"
 replay_inputs=()
 seed_inputs=()
 sdg_rules="${MORPHEUS_LIBAFL_SDG_RULES:-}"
+require_sdg="${MORPHEUS_LIBAFL_REQUIRE_SDG:-false}"
 disable_sdg="${MORPHEUS_LIBAFL_DISABLE_SDG:-}"
 sdg_metadata="${MORPHEUS_LIBAFL_SDG_METADATA_DIR:-}"
 mutational_max_iterations="${MORPHEUS_LIBAFL_MUTATIONAL_MAX_ITERATIONS:-}"
@@ -1779,6 +1780,7 @@ fi
 if [ -n "${sdg_rules}" ]; then
   launch_env+=("MORPHEUS_LIBAFL_SDG_RULES=${sdg_rules}")
 fi
+launch_env+=("MORPHEUS_LIBAFL_REQUIRE_SDG=${require_sdg}")
 # Semantic sidecar directory: derived from the corpus dir as a sibling
 # (<corpus-name>.sdg-metadata) when not set explicitly, so it stays outside
 # the corpus file enumeration.

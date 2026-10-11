@@ -27,6 +27,13 @@ impl Default for ScenarioGenerator {
 }
 
 impl ScenarioGenerator {
+    /// Number of loaded rules and rules with resolved source placements.
+    #[must_use]
+    pub fn rule_counts(&self) -> (usize, usize) {
+        self.sdg.as_ref().map_or((0, 0), |sdg| (sdg.rules.len(),
+            sdg.rules.iter().filter(|rule| rule.runtime_blockers().is_empty()).count()))
+    }
+
     #[must_use]
     pub fn new(max_actions: NonZeroUsize) -> Self {
         Self {
@@ -98,9 +105,9 @@ where
 {
     fn generate(&mut self, state: &mut S) -> Result<ScenarioInput, Error> {
         if let Some(sdg) = &self.sdg {
-            // An empty but valid rule directory selects the documented
+            // Empty directories and rules awaiting runtime bindings select
             // fallback random generation instead of aborting.
-            if !sdg.rules.is_empty() {
+            if sdg.has_executable_rules() {
                 let mut scenario = sdg.generate(state.rand_mut())
                     .map_err(|e| Error::illegal_argument(format!("SDG generation failed: {e}")))?;
                 // Find the rule to provide node metadata for lowering.

@@ -1,3 +1,4 @@
 builds/
 tests/fixtures/*.bc
 /*.json
+!/kernel-success-assumptions.json

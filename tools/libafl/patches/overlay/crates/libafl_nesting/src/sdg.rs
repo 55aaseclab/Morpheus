@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::input::{CoherentAlloc, DmaSection, MmioSection, ScenarioInput, StreamUnit, WordModel};
 
+#[path = "sdg_semantic.rs"]
+pub mod semantic;
+
 /// Semantic value held in a scenario. Width is enforced by the source node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Value {
@@ -117,6 +120,8 @@ impl Head {
 
 #[derive(Clone, Debug)]
 pub struct Rule {
+    /// Full semantic rule when loaded from sdg 1.2.
+    pub semantic: Option<alloc::sync::Arc<semantic::SemanticRule>>,
     /// Canonical rule id, preserved verbatim from the extractor.
     pub name: String,
     pub nodes: Vec<Node>,
@@ -126,6 +131,10 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// Binding issues prevent execution, without discarding the published rule.
+    pub fn runtime_blockers(&self) -> &[semantic::RuntimeBlocker] {
+        self.semantic.as_ref().map_or(&[], |s| s.blockers.as_slice())
+    }
     /// Find the node referenced by a condition.
     #[must_use]
     pub fn node_for(&self, name: &str) -> Option<&Node> {
@@ -404,12 +413,21 @@ impl SemanticScenario {
 }
 
 impl SemanticDependencyGraph {
+    /// IRQ-only rules and sources without concrete bindings stay inspectable
+    /// but are excluded from generation.
+    pub fn has_executable_rules(&self) -> bool {
+        self.rules.iter().any(|rule| rule.runtime_blockers().is_empty())
+    }
     #[cfg(feature = "std")]
     pub fn from_dir(path: &std::path::Path) -> Result<Self, String> {
+        if path.join("runtime.json").exists() || path.join("evidence.pack").exists() {
+            return semantic::load_package(path);
+        }
         // An empty but valid rule directory is not an error: the
         // integration selects the documented fallback random generation and
         // mutation when no rules are present.
         let mut rules = Vec::new();
+        let mut pool = semantic::GraphPool::default();
         let mut entries: Vec<_> = std::fs::read_dir(path)
             .map_err(|e| format!("failed to read SDG rule directory {}: {e}", path.display()))?
             .collect::<Result<Vec<_>, _>>()
@@ -419,7 +437,7 @@ impl SemanticDependencyGraph {
         for entry in entries {
             let path = entry.path();
             if path.extension().and_then(|x| x.to_str()) == Some("sdg") {
-                rules.push(parse_rule(&std::fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))?)?);
+                rules.push(semantic::load_file(&path, &mut pool)?);
             }
         }
         // Duplicate canonical rule ids are identity conflicts; they are never
@@ -440,6 +458,7 @@ impl SemanticDependencyGraph {
     /// draws are recorded in the scenario for exact later reuse.
     pub fn generate<R: Rand>(&self, rand: &mut R) -> Result<SemanticScenario, String> {
         let rule = choose_rule(&self.rules, rand)?;
+        if rule.semantic.is_some() { return semantic::generate(rule, rand); }
         let mut scenario = SemanticScenario {
             target_rule: rule.name.clone(),
             values: alloc::collections::BTreeMap::new(),
@@ -515,6 +534,8 @@ impl SemanticDependencyGraph {
         // Mutate the exact scenario that was recorded for these bytes; a
         // rule that is no longer in the graph makes the metadata stale.
         let rule = self.rules.iter().find(|r| r.name == parent.target_rule)?;
+
+        if rule.semantic.is_some() { return semantic::mutate(rule, rand, input, parent); }
 
         let target_node = rule.node_for(rule.target_var())?;
         let placement = parent.placements.get(rule.target_var()).copied()?;
@@ -630,7 +651,7 @@ fn cross_merge<R: Rand>(
 ) {
     let secondary_candidates: Vec<&Rule> = rules
         .iter()
-        .filter(|r| r.name != primary.name)
+        .filter(|r| r.name != primary.name && r.semantic.is_none())
         .collect();
     if secondary_candidates.is_empty() {
         return;
@@ -1204,7 +1225,8 @@ pub fn lift_with(
     };
     for node in &rule.nodes {
         let placement = placements.get(&node.name).copied()?;
-        let value = read_node_value(input, node, placement)?;
+        let value = if rule.semantic.is_some() { semantic::read_value(rule, input, node, placement)? }
+                    else { read_node_value(input, node, placement)? };
         let value = Value::from_u64(value, node.width_bits).ok()?;
         scenario.values.insert(node.name.clone(), value);
         scenario.nodes.insert(node.name.clone(), node.clone());
@@ -1368,6 +1390,7 @@ fn write_bytes_at<R: Rand>(models: &mut Vec<WordModel>, offset: u32, bytes: &[u8
 /// into the scenario so the metadata stays complete. Lowering never depends
 /// on `HashMap` iteration order and never recovers placement from the wire.
 pub fn lower_scenario<R: Rand>(scenario: &mut SemanticScenario, _rule: &Rule, rand: &mut R) -> Result<ScenarioInput, String> {
+    if _rule.semantic.is_some() { return semantic::lower(_rule, scenario, rand); }
     let mut mmio = Vec::new();
     let mut coherent = Vec::new();
     let mut streaming = Vec::new();
@@ -1488,8 +1511,10 @@ fn random_u64<R: Rand>(rand: &mut R) -> u64 {
 }
 
 fn choose_rule<'a, R: Rand>(rules: &'a [Rule], rand: &mut R) -> Result<&'a Rule, String> {
-    if rules.is_empty() { return Err("no rules".into()); }
-    Ok(&rules[rand.below(unsafe { NonZeroUsize::new_unchecked(rules.len()) })])
+    let available: Vec<&Rule> = rules.iter().filter(|r| r.semantic.as_ref()
+        .is_none_or(|s| s.blockers.is_empty())).collect();
+    if available.is_empty() { return Err("no executable rules: inspect runtime_blockers()".into()); }
+    Ok(available[rand.below(unsafe { NonZeroUsize::new_unchecked(available.len()) })])
 }
 
 fn sorted_preconditions(rule: &Rule) -> Vec<&Condition> {
@@ -1616,6 +1641,7 @@ fn parse_predicate_tokens(tokens: &[&str]) -> Result<Predicate, String> {
 }
 
 fn parse_rule(text: &str) -> Result<Rule, String> {
+    if text.starts_with("sdg 1.2\n") { return semantic::parse(text); }
     let mut name = String::new();
     let mut nodes = Vec::new();
     let mut pre = Vec::new();
@@ -1705,7 +1731,7 @@ fn parse_rule(text: &str) -> Result<Rule, String> {
     if !trigger.src.is_empty() && trigger.src != trigger.dst {
         return Err("trigger is not a self-edge".into());
     }
-    let rule = Rule { name, nodes, preconditions: pre, trigger, mutation };
+    let rule = Rule { name, nodes, preconditions: pre, trigger, mutation, semantic: None };
     validate_canonical_rule_id(&rule)?;
     Ok(rule)
 }

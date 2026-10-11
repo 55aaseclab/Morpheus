@@ -62,6 +62,12 @@
         "sdg-rules": {
           "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/sdg-rules.json"
         },
+        "sdg-candidates": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/sdg-candidates.json"
+        },
+        "rss-rule": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/rss-rule.json"
+        },
         "sdg-nodes": {
           "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/sdg-nodes.json"
         },
@@ -70,6 +76,39 @@
         },
         "sdg-files": {
           "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/sdg"
+        },
+        "sdg-manifest": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/sdg/manifest.json"
+        },
+        "assumption-policy": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/assumption-policy.json"
+        },
+        "assumption-ledger": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/assumption-ledger.json"
+        },
+        "path-assumptions": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/path-assumptions.csv"
+        },
+        "mutation-hints": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/mutation-hints.csv"
+        },
+        "path-assumptions-report": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/path-assumptions.md"
+        },
+        "analysis-coverage": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/analysis-coverage.json"
+        },
+        "sdg-conditional-files": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/sdg-conditional"
+        },
+        "sdg-unresolved-files": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/sdg-unresolved"
+        },
+        "runtime-sdg-files": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/runtime-sdg"
+        },
+        "sdg-runtime-package": {
+          "pathTemplate": "tools/sdg-extractor/builds/{buildDirKey}/output/runtime-package"
         }
       },
       "commands": {

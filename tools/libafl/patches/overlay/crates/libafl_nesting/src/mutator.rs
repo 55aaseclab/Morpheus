@@ -278,12 +278,12 @@ where
         input: &mut ScenarioInput,
     ) -> Result<MutationResult, Error> {
         let original = encode_scenario(input);
-        let sdg_nonempty = self
+        let has_executable_rules = self
             .generator
             .sdg()
-            .is_some_and(|sdg| !sdg.rules.is_empty());
+            .is_some_and(|sdg| sdg.has_executable_rules());
 
-        if sdg_nonempty {
+        if has_executable_rules {
             // Docs §5.4: a small deterministic probability performs the
             // existing random wire mutation; otherwise rule-aware semantic
             // mutation runs.
