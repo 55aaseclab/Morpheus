@@ -52,5 +52,9 @@ projects/*/workspace/**
 !projects/*/workspace/tools/*/scripts/
 !projects/*/workspace/tools/*/scripts/**
 crashes/
-core
+# Bare-name core dumps land at the workspace root; keep that pattern
+# anchored so source directories named core/ (e.g.
+# apps/morpheus/src/core/) stay tracked.  PID-suffixed dumps may appear
+# in any tool build directory, so keep core.* unanchored.
+/core
 core.*
